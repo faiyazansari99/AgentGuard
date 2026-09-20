@@ -1,0 +1,17 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pydantic==2.11.7
+email-validator==2.3.0
+PyJWT==2.10.1
+passlib[argon2]==1.7.4
+SQLAlchemy==2.0.43
+psycopg[binary]==3.2.9
+redis==6.4.0
+python-multipart==0.0.20
+alembic==1.16.4
+pyotp==2.9.0
+cryptography==45.0.6
+stripe==12.5.1
+prometheus-client==0.22.1
+httpx==0.28.1
+pytest==8.4.1
