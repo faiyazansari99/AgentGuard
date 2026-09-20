@@ -128,7 +128,6 @@ class Incident(Base):
     org_id: Mapped[str] = mapped_column(String(32), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-
 app = FastAPI(title="AgentGuard", version="2.0.0", description="AI Agent Governance & Audit Control Plane")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type", "X-API-Key"])
 
@@ -373,7 +372,8 @@ def gateway(x: GatewayIn, authorization: str | None = Header(None), x_api_key: s
                     if p.effect=="ALLOW" and decision=="ALLOW": reason=p.name
             if decision=="APPROVAL_REQUIRED":
                 s.add(Approval(id=uid(),agent=x.agent_id,action=x.action,amount=x.amount,status="pending",requested_by=u["sub"],org_id=u["org"]))
-        audit(s,u,x.agent_id,x.action,decision,x.details); s.commit()
+
+audit(s,u,x.agent_id,x.action,decision,x.details); s.commit()
         return {"decision":decision,"reason":reason}
 
 @app.get("/api/approvals")
@@ -516,5 +516,8 @@ async def billing_webhook(request: Request, stripe_signature: str | None = Heade
     try: event=stripe.Webhook.construct_event(payload,stripe_signature,secret)
     except Exception: raise HTTPException(400,'Invalid Stripe webhook')
     return {'received':True,'type':event['type']}
-    from mangum import Mangum
+
+from mangum import Mangum
 handler = Mangum(app)
+                          
+    
