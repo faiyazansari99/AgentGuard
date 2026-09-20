@@ -516,3 +516,5 @@ async def billing_webhook(request: Request, stripe_signature: str | None = Heade
     try: event=stripe.Webhook.construct_event(payload,stripe_signature,secret)
     except Exception: raise HTTPException(400,'Invalid Stripe webhook')
     return {'received':True,'type':event['type']}
+    from mangum import Mangum
+handler = Mangum(app)
