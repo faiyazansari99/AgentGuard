@@ -354,7 +354,91 @@ def policies(u=Depends(auth)):
 def add_policy(x: PolicyIn,u=Depends(require_role("owner","admin","security","developer"))):
     if x.effect not in {"ALLOW","BLOCK","APPROVAL_REQUIRED"}: raise HTTPException(422,"Invalid policy effect")
     with db() as s:
-        p=Policy(id=uid(),name=x.name,act
+        p=Policy(id=uid(),name=x.name,action=x.action,resource=x.resource,effect=x.effect,threshold=x.threshold,org_id=u["org"]); s.add(p); s.commit(); audit(s,u,"","policy.create","ALLOW",x.name); return {"id":p.id}
+
+@app.post("/api/gateway/check")
+def gateway(x: GatewayIn, authorization: str | None = Header(None), x_api_key: str | None = Header(None)):
+    if x_api_key:
+        u = auth_api_key(x_api_key)
+        if "gateway:check" not in [v.strip() for v in u.get("scopes", "").split(",")]:
+            raise HTTPException(403, "API key lacks gateway:check scope")
+    else:
+        u = auth(authorization)
+    with db() as s:
+        a=s.scalar(select(Agent).where(Agent.id==x.agent_id,Agent.org_id==u["org"]))
+        if not a: raise HTTPException(404,"Agent not found")
+        decision="ALLOW"; reason="No policy matched"
+        if a.status != "active": decision="BLOCK"; reason="Agent is paused"
+        else:
+            for p in s.scalars(select(Policy).where(Policy.org_id==u["org"])).all():
+                if p.action in ("*",x.action) and (p.resource=="*" or p.resource==x.resource) and x.amount >= p.threshold:
+                    if p.effect=="BLOCK": decision,reason="BLOCK",p.name; break
+                    if p.effect=="APPROVAL_REQUIRED": decision,reason="APPROVAL_REQUIRED",p.name
+                    if p.effect=="ALLOW" and decision=="ALLOW": reason=p.name
+            if decision=="APPROVAL_REQUIRED":
+                s.add(Approval(id=uid(),agent=x.agent_id,action=x.action,amount=x.amount,status="pending",requested_by=u["sub"],org_id=u["org"]))
+        audit(s,u,x.agent_id,x.action,decision,x.details); s.commit()
+        return {"decision":decision,"reason":reason}
+
+@app.get("/api/approvals")
+def approvals(u=Depends(auth)):
+    with db() as s: return [x.__dict__ | {} for x in s.scalars(select(Approval).where(Approval.org_id==u["org"]).order_by(Approval.created_at.desc())).all()]
+
+@app.post("/api/approvals/{aid}/decision")
+def approval_decision(aid: str,x: ApprovalDecision,u=Depends(require_role("owner","admin","approver"))):
+    with db() as s:
+        a=s.scalar(select(Approval).where(Approval.id==aid,Approval.org_id==u["org"]))
+        if not a: raise HTTPException(404,"Approval not found")
+        a.status=x.status; audit(s,u,a.agent,"approval.decision",x.status,{"approval":aid}); s.commit(); return {"status":a.status}
+
+@app.get("/api/audit")
+def logs(u=Depends(auth)):
+    with db() as s: return [x.__dict__ | {} for x in s.scalars(select(Audit).where(Audit.org_id==u["org"]).order_by(Audit.id.desc()).limit(500)).all()]
+
+@app.get('/api/integrations/oauth/{provider}/start')
+def integration_oauth_start(provider:str,u=Depends(auth)):
+    c=_oauth_config(provider); redirect=os.getenv("OAUTH_REDIRECT_BASE","http://localhost:8000")+f"/api/integrations/oauth/{provider}/callback"
+    state=jwt.encode({"provider":provider,"org":u["org"],"sub":u["sub"],"purpose":"integration","exp":now()+timedelta(minutes=10)},JWT_SECRET,algorithm=JWT_ALG)
+    params={"client_id":c["client_id"],"redirect_uri":redirect,"response_type":"code","scope":c["scope"],"state":state}
+    return {"authorization_url":c["auth"]+"?"+urllib.parse.urlencode(params)}
+
+@app.get('/api/integrations/oauth/{provider}/callback')
+def integration_oauth_callback(provider:str,code:str,state:str):
+    c=_oauth_config(provider); redirect=os.getenv("OAUTH_REDIRECT_BASE","http://localhost:8000")+f"/api/integrations/oauth/{provider}/callback"
+    try:
+        claims=jwt.decode(state,JWT_SECRET,algorithms=[JWT_ALG])
+        if claims.get("purpose")!="integration" or claims.get("provider")!=provider: raise ValueError()
+    except Exception: raise HTTPException(400,"Invalid OAuth state")
+    data=_post_form(c["token"],{"client_id":c["client_id"],"client_secret":c["client_secret"],"code":code,"grant_type":"authorization_code","redirect_uri":redirect})
+    access=data.get("access_token")
+    if not access: raise HTTPException(400,"OAuth token exchange failed")
+    f=_fernet(); ciphertext=f.encrypt(access.encode()).decode()
+    external_account=provider
+    try:
+        req=urllib.request.Request(c["userinfo"],headers={"Authorization":f"Bearer {access}"})
+        with urllib.request.urlopen(req,timeout=10) as r: profile=json.loads(r.read())
+        external_account=profile.get("email") or profile.get("team",{}).get("name") or provider
+    except Exception: pass
+    with db() as s:
+        row=Integration(id=uid(),provider=provider,status="connected",org_id=claims["org"],external_account=external_account,token_ciphertext=ciphertext)
+        s.add(row); s.commit()
+    return {"connected":True,"provider":provider,"external_account":external_account,"message":"Integration connected. You can close this window."}
+
+@app.get("/api/integrations")
+def integrations(u=Depends(auth)):
+    with db() as s: return [{"id":x.id,"provider":x.provider,"status":x.status,"external_account":x.external_account,"created_at":x.created_at} for x in s.scalars(select(Integration).where(Integration.org_id==u["org"]).order_by(Integration.created_at.desc())).all()]
+
+@app.delete("/api/integrations/{iid}")
+def disconnect_integration(iid:str,u=Depends(require_role("owner","admin","security"))):
+    with db() as s:
+        x=s.scalar(select(Integration).where(Integration.id==iid,Integration.org_id==u["org"]))
+        if not x: raise HTTPException(404,"Integration not found")
+        s.delete(x); audit(s,u,"", "integration.disconnect","ALLOW",iid); s.commit(); return {"disconnected":True}
+
+@app.get("/api/incidents")
+def incidents(u=Depends(auth)):
+    with db() as s: return [x.__dict__ | {} for x in s.scalars(select(Incident).where(Incident.org_id==u["org"]).order_by(Incident.created_at.desc())).all()]
+
 @app.get("/api/api-keys")
 def keys(u=Depends(auth)):
     with db() as s: return [{"id":x.id,"name":x.name,"status":x.status,"last_used":x.last_used,"created_at":x.created_at,"scopes":x.scopes} for x in s.scalars(select(ApiKey).where(ApiKey.org_id==u["org"])).all()]
@@ -439,3 +523,4 @@ async def billing_webhook(request: Request, stripe_signature: str | None = Heade
 
 from mangum import Mangum
 handler = Mangum(app)
+    
