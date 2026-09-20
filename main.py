@@ -131,7 +131,6 @@ class Incident(Base):
 app = FastAPI(title="AgentGuard", version="2.0.0", description="AI Agent Governance & Audit Control Plane")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_credentials=True, allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"], allow_headers=["Authorization", "Content-Type", "X-API-Key"])
 
-
 def now() -> datetime: return datetime.now(timezone.utc)
 def uid() -> str: return secrets.token_hex(16)
 def token(user: User) -> str:
@@ -162,7 +161,6 @@ def audit(dbx: Session, u: dict[str, Any], agent: str, action: str, decision: st
     material = f"{prev_hash}|{u['sub']}|{agent or ''}|{action}|{decision}|{detail_text}|{now().isoformat()}"
     row = Audit(actor=u["sub"], org_id=u["org"], agent=agent or "", action=action, decision=decision, details=detail_text, integrity_hash=hashlib.sha256(material.encode()).hexdigest())
     dbx.add(row)
-
 
 class Register(BaseModel): email: EmailStr; password: str = Field(min_length=12)
 class Login(BaseModel): email: EmailStr; password: str
@@ -200,7 +198,7 @@ def send_email(to:str, subject:str, body:str):
     from email.message import EmailMessage
     msg=EmailMessage(); msg["Subject"]=subject; msg["From"]=sender; msg["To"]=to; msg.set_content(body)
     with smtplib.SMTP(host,port,timeout=10) as smtp:
-        smtp.starttls();
+        smtp.starttls()
         if user: smtp.login(user,password or "")
         smtp.send_message(msg)
     return True
@@ -221,6 +219,7 @@ async def security_headers(request: Request, call_next):
 
 @app.get("/")
 def home(): return FileResponse(BASE / "static/index.html")
+
 @app.get("/metrics")
 def metrics():
     try:
@@ -311,6 +310,12 @@ def mfa_verify(x:MfaCode,u=Depends(auth)):
         if not user or not user.mfa_secret or not pyotp.TOTP(user.mfa_secret).verify(x.code, valid_window=1): raise HTTPException(400,"Invalid MFA code")
         user.mfa_enabled=True; s.commit(); return {"enabled":True}
 
+def require_role(*roles: str):
+    def dep(u=Depends(auth)):
+        if u.get("role") not in roles: raise HTTPException(403, "Insufficient role")
+        return u
+    return dep
+
 @app.get("/api/agents")
 def agents(u=Depends(auth)):
     with db() as s: return [x.__dict__ | {} for x in s.scalars(select(Agent).where(Agent.org_id==u["org"]).order_by(Agent.created_at.desc())).all()]
@@ -323,14 +328,14 @@ def add_agent(x: AgentIn, u=Depends(require_role("owner","admin","developer"))):
 @app.post("/api/agents/{aid}/pause")
 def pause(aid: str,u=Depends(require_role("owner","admin","security"))):
     with db() as s:
-        a=s.scalar(select(Agent).where(Agent.id==aid,Agent.org_id==u["org"]));
+        a=s.scalar(select(Agent).where(Agent.id==aid,Agent.org_id==u["org"]))
         if not a: raise HTTPException(404,"Agent not found")
         a.status="paused"; s.commit(); audit(s,u,aid,"agent.pause","ALLOW"); return {"status":"paused"}
 
 @app.post("/api/agents/{aid}/resume")
 def resume(aid: str,u=Depends(require_role("owner","admin","security"))):
     with db() as s:
-        a=s.scalar(select(Agent).where(Agent.id==aid,Agent.org_id==u["org"]));
+        a=s.scalar(select(Agent).where(Agent.id==aid,Agent.org_id==u["org"]))
         if not a: raise HTTPException(404,"Agent not found")
         a.status="active"; s.commit(); audit(s,u,aid,"agent.resume","ALLOW"); return {"status":"active"}
 
@@ -349,92 +354,7 @@ def policies(u=Depends(auth)):
 def add_policy(x: PolicyIn,u=Depends(require_role("owner","admin","security","developer"))):
     if x.effect not in {"ALLOW","BLOCK","APPROVAL_REQUIRED"}: raise HTTPException(422,"Invalid policy effect")
     with db() as s:
-        p=Policy(id=uid(),name=x.name,action=x.action,resource=x.resource,effect=x.effect,threshold=x.threshold,org_id=u["org"]); s.add(p); s.commit(); audit(s,u,"","policy.create","ALLOW",x.name); return {"id":p.id}
-
-@app.post("/api/gateway/check")
-def gateway(x: GatewayIn, authorization: str | None = Header(None), x_api_key: str | None = Header(None)):
-    if x_api_key:
-        u = auth_api_key(x_api_key)
-        if "gateway:check" not in [v.strip() for v in u.get("scopes", "").split(",")]:
-            raise HTTPException(403, "API key lacks gateway:check scope")
-    else:
-        u = auth(authorization)
-    with db() as s:
-        a=s.scalar(select(Agent).where(Agent.id==x.agent_id,Agent.org_id==u["org"]))
-        if not a: raise HTTPException(404,"Agent not found")
-        decision="ALLOW"; reason="No policy matched"
-        if a.status != "active": decision="BLOCK"; reason="Agent is paused"
-        else:
-            for p in s.scalars(select(Policy).where(Policy.org_id==u["org"])).all():
-                if p.action in ("*",x.action) and (p.resource=="*" or p.resource==x.resource) and x.amount >= p.threshold:
-                    if p.effect=="BLOCK": decision,reason="BLOCK",p.name; break
-                    if p.effect=="APPROVAL_REQUIRED": decision,reason="APPROVAL_REQUIRED",p.name
-                    if p.effect=="ALLOW" and decision=="ALLOW": reason=p.name
-            if decision=="APPROVAL_REQUIRED":
-                s.add(Approval(id=uid(),agent=x.agent_id,action=x.action,amount=x.amount,status="pending",requested_by=u["sub"],org_id=u["org"]))
-
-audit(s,u,x.agent_id,x.action,decision,x.details); s.commit()
-        return {"decision":decision,"reason":reason}
-
-@app.get("/api/approvals")
-def approvals(u=Depends(auth)):
-    with db() as s: return [x.__dict__ | {} for x in s.scalars(select(Approval).where(Approval.org_id==u["org"]).order_by(Approval.created_at.desc())).all()]
-
-@app.post("/api/approvals/{aid}/decision")
-def approval_decision(aid: str,x: ApprovalDecision,u=Depends(require_role("owner","admin","approver"))):
-    with db() as s:
-        a=s.scalar(select(Approval).where(Approval.id==aid,Approval.org_id==u["org"]));
-        if not a: raise HTTPException(404,"Approval not found")
-        a.status=x.status; audit(s,u,a.agent,"approval.decision",x.status,{"approval":aid}); s.commit(); return {"status":a.status}
-
-@app.get("/api/audit")
-def logs(u=Depends(auth)):
-    with db() as s: return [x.__dict__ | {} for x in s.scalars(select(Audit).where(Audit.org_id==u["org"]).order_by(Audit.id.desc()).limit(500)).all()]
-
-@app.get('/api/integrations/oauth/{provider}/start')
-def integration_oauth_start(provider:str,u=Depends(auth)):
-    c=_oauth_config(provider); redirect=os.getenv("OAUTH_REDIRECT_BASE","http://localhost:8000")+f"/api/integrations/oauth/{provider}/callback"
-    state=jwt.encode({"provider":provider,"org":u["org"],"sub":u["sub"],"purpose":"integration","exp":now()+timedelta(minutes=10)},JWT_SECRET,algorithm=JWT_ALG)
-    params={"client_id":c["client_id"],"redirect_uri":redirect,"response_type":"code","scope":c["scope"],"state":state}
-    return {"authorization_url":c["auth"]+"?"+urllib.parse.urlencode(params)}
-
-@app.get('/api/integrations/oauth/{provider}/callback')
-def integration_oauth_callback(provider:str,code:str,state:str):
-    c=_oauth_config(provider); redirect=os.getenv("OAUTH_REDIRECT_BASE","http://localhost:8000")+f"/api/integrations/oauth/{provider}/callback"
-    try:
-        claims=jwt.decode(state,JWT_SECRET,algorithms=[JWT_ALG])
-        if claims.get("purpose")!="integration" or claims.get("provider")!=provider: raise ValueError()
-    except Exception: raise HTTPException(400,"Invalid OAuth state")
-    data=_post_form(c["token"],{"client_id":c["client_id"],"client_secret":c["client_secret"],"code":code,"grant_type":"authorization_code","redirect_uri":redirect})
-    access=data.get("access_token")
-    if not access: raise HTTPException(400,"OAuth token exchange failed")
-    f=_fernet(); ciphertext=f.encrypt(access.encode()).decode()
-    external_account=provider
-    try:
-        req=urllib.request.Request(c["userinfo"],headers={"Authorization":f"Bearer {access}"})
-        with urllib.request.urlopen(req,timeout=10) as r: profile=json.loads(r.read())
-        external_account=profile.get("email") or profile.get("team",{}).get("name") or provider
-    except Exception: pass
-    with db() as s:
-        row=Integration(id=uid(),provider=provider,status="connected",org_id=claims["org"],external_account=external_account,token_ciphertext=ciphertext)
-        s.add(row); s.commit()
-    return {"connected":True,"provider":provider,"external_account":external_account,"message":"Integration connected. You can close this window."}
-
-@app.get("/api/integrations")
-def integrations(u=Depends(auth)):
-    with db() as s: return [{"id":x.id,"provider":x.provider,"status":x.status,"external_account":x.external_account,"created_at":x.created_at} for x in s.scalars(select(Integration).where(Integration.org_id==u["org"]).order_by(Integration.created_at.desc())).all()]
-
-@app.delete("/api/integrations/{iid}")
-def disconnect_integration(iid:str,u=Depends(require_role("owner","admin","security"))):
-    with db() as s:
-        x=s.scalar(select(Integration).where(Integration.id==iid,Integration.org_id==u["org"]))
-        if not x: raise HTTPException(404,"Integration not found")
-        s.delete(x); audit(s,u,"", "integration.disconnect","ALLOW",iid); s.commit(); return {"disconnected":True}
-
-@app.get("/api/incidents")
-def incidents(u=Depends(auth)):
-    with db() as s: return [x.__dict__ | {} for x in s.scalars(select(Incident).where(Incident.org_id==u["org"]).order_by(Incident.created_at.desc())).all()]
-
+        p=Policy(id=uid(),name=x.name,act
 @app.get("/api/api-keys")
 def keys(u=Depends(auth)):
     with db() as s: return [{"id":x.id,"name":x.name,"status":x.status,"last_used":x.last_used,"created_at":x.created_at,"scopes":x.scopes} for x in s.scalars(select(ApiKey).where(ApiKey.org_id==u["org"])).all()]
@@ -448,7 +368,7 @@ def create_key(name: str="Agent key", scopes: str="gateway:check", u=Depends(req
 @app.delete("/api/api-keys/{kid}")
 def revoke_key(kid: str,u=Depends(require_role("owner","admin","security"))):
     with db() as s:
-        k=s.scalar(select(ApiKey).where(ApiKey.id==kid,ApiKey.org_id==u["org"]));
+        k=s.scalar(select(ApiKey).where(ApiKey.id==kid,ApiKey.org_id==u["org"]))
         if not k: raise HTTPException(404,"API key not found")
         k.status="revoked"; audit(s,u,"","api_key.revoke","ALLOW",kid); s.commit(); return {"revoked":True}
 
@@ -519,5 +439,3 @@ async def billing_webhook(request: Request, stripe_signature: str | None = Heade
 
 from mangum import Mangum
 handler = Mangum(app)
-                          
-    
