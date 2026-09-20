@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, create_engine, select, delete
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 from passlib.context import CryptContext
-from .redis_limiter import rate_limiter
+from redis_limiter import rate_limiter
 
 BASE = Path(__file__).resolve().parent.parent
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BASE/'agentguard.db'}")
