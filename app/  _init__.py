@@ -2,4 +2,4 @@
 from .main import app
 
 __all__ = ["app"]
-__version__ = "2.0.0"p
+__version__ = "2.0.0"
