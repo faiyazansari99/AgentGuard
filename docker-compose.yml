@@ -3,20 +3,15 @@ services:
     build: .
     ports: ["8000:8000"]
     env_file: .env
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+    environment:
+      DATABASE_URL: postgresql+psycopg://agentguard:${POSTGRES_PASSWORD:-CHANGE_ME}@postgres:5432/agentguard
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_started
     restart: unless-stopped
-    networks:
-      - agentguard
 
   postgres:
     image: postgres:17-alpine
@@ -32,8 +27,6 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
-    networks:
-      - agentguard
 
   redis:
     image: redis:8-alpine
@@ -41,24 +34,7 @@ services:
     volumes:
       - redisdata:/data
     restart: unless-stopped
-    networks:
-      - agentguard
-
-  prometheus:
-    image: prom/prometheus:latest
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - promdata:/prometheus
-    ports: ["9090:9090"]
-    restart: unless-stopped
-    networks:
-      - agentguard
 
 volumes:
   pgdata:
   redisdata:
-  promdata:
-
-networks:
-  agentguard:
-    driver: bridge
